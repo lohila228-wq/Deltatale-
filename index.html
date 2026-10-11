@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>DELTATALE</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; touch-action: none; user-select: none; }
+  html, body { height: 100%; overflow: hidden; background: #000; font-family: monospace; }
+  #game { display: block; width: 100vw; height: 100vh; }
+  #controls {
+    position: fixed; bottom: 0; left: 0; width: 100%;
+    display: flex; justify-content: space-between;
+    padding: 10px; pointer-events: none;
+  }
+  .dpad {
+    display: grid;
+    grid-template-columns: repeat(3, 60px);
+    grid-template-rows: repeat(3, 60px);
+    gap: 4px; pointer-events: auto;
+  }
+  .dpad button, .action button {
+    background: rgba(255,255,255,0.15);
+    border: 2px solid rgba(255,255,255,0.4);
+    color: #fff; font-size: 22px; border-radius: 10px;
+    font-weight: bold; cursor: pointer;
+  }
+  .dpad button:active, .action button:active { background: rgba(255,255,255,0.4); }
+  .action { display: flex; flex-direction: column; gap: 10px; pointer-events: auto; }
+  .action button { width: 80px; height: 80px; font-size: 20px; }
+  .empty { visibility: hidden; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="controls">
+  <div class="dpad">
+    <button class="empty"></button>
+    <button data-key="up">▲</button>
+    <button class="empty"></button>
+    <button data-key="left">◀</button>
+    <button class="empty"></button>
+    <button data-key="right">▶</button>
+    <button class="empty"></button>
+    <button data-key="down">▼</button>
+    <button class="empty"></button>
+  </div>
+  <div class="action">
+    <button data-key="z">Z</button>
+    <button data-key="x">X</button>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+const W = 640, H = 480;
+function resize() {
+  const scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.width = W;
+  canvas.height = H;
+  canvas.style.width = (W * scale) + 'px';
+  canvas.style.height = (H * scale) + 'px';
+  canvas.style.position = 'absolute';
+  canvas.style.left = ((window.innerWidth - W * scale) / 2) + 'px';
+  canvas.style.top = ((window.innerHeight - H * scale) / 2) + 'px';
+}
+window.addEventListener('resize', resize);
+resize();
+
+const keys = {};
+document.querySelectorAll('button[data-key]').forEach(btn => {
+  const k = btn.dataset.key;
+  const press = e => { e.preventDefault(); keys[k] = true; onKeyPress(k); };
+  const release = e => { e.preventDefault(); keys[k] = false; };
+  btn.addEventListener('touchstart', press);
+  btn.addEventListener('touchend', release);
+  btn.addEventListener('mousedown', press);
+  btn.addEventListener('mouseup', release);
+});
+document.addEventListener('keydown', e => {
+  const map = { ArrowUp:'up', ArrowDown:'down', ArrowLeft:'left', ArrowRight:'right',
+                w:'up', s:'down', a:'left', d:'right', z:'z', Z:'z', x:'x', X:'x',
+                Enter:'z', r:'r', R:'r' };
+  const k = map[e.key];
+  if (k) { keys[k] = true; onKeyPress(k); }
+});
+document.addEventListener('keyup', e => {
+  const map = { ArrowUp:'up', ArrowDown:'down', ArrowLeft:'left', ArrowRight:'right',
+                w:'up', s:'down', a:'left', d:'right', z:'z', Z:'z', x:'x', X:'x',
+                Enter:'z', r:'r', R:'r' };
+  const k = map[e.key];
+  if (k) keys[k] = false;
+});
+
+function onKeyPress(k) {
+  if (k === 'r' && (state === 'gameover' || state === 'win')) { resetGame(); return; }
+  if (state === 'menu') {
+    if (k === 'left') player.menuIndex = (player.menuIndex + 3) % 4;
+    if (k === 'right') player.menuIndex = (player.menuIndex + 1) % 4;
+    if (k === 'z') {
+      const c = menuOptions[player.menuIndex];
+      if (c === 'FIGHT') doAttack();
+      else if (c === 'ACT') { state = 'act'; player.subIndex = 0; }
+      else if (c === 'ITEM') state = 'item';
+      else if (c === 'SPARE') doSpare();
+    }
+  } else if (state === 'act') {
+    if (k === 'up') player.subIndex = (player.subIndex + currentEnemy.dialogue.length - 1) % currentEnemy.dialogue.length;
+    if (k === 'down') player.subIndex = (player.subIndex + 1) % currentEnemy.dialogue.length;
+    if (k === 'z') doAct();
+    if (k === 'x') state = 'menu';
+  } else if (state === 'item') {
+    if (k === 'z') doItem();
+    if (k === 'x') state = 'menu';
+  } else if (state === 'attack') {
+    if (k === 'z') resolveAttack();
+  } else if (state === 'dialog') {
+    if (k === 'z' && stateTimer > 20) {
+      if (currentEnemy.hp <= 0) nextEnemyOrWin();
+      else startEnemyTurn();
+    }
+  }
+}
+
+const player = {
+  maxHp: 20, hp: 20, tp: 0, kr: 0,
+  attack: 5, defense: 2,
+  soulX: W/2, soulY: H/2 + 60, soulSpeed: 4,
+  invuln: 0, menuIndex: 0, subIndex: 0
+};
+
+function makeEnemy(name, hp, color, attacks, dialogue, spare) {
+  return { name, hp, maxHp: hp, color, attacks, dialogue, spareCondition: spare, mercy: 0, x: W/2, y: 140 };
+}
+let enemies = [
+  makeEnemy('Lancer', 30, '#3399ff', ['bulletsDown','spades'],
+    ['Lancer хихикает.','Lancer споткнулся!','Lancer предлагает дружбу.'], 3),
+  makeEnemy('Susie', 50, '#c800c8', ['axes','bulletsDown','random'],
+    ['Susie рычит.','Susie голодна.','Susie готова к бою!'], 3)
+];
+let currentEnemy = enemies[0];
+const isSparable = () => currentEnemy.mercy >= currentEnemy.spareCondition;
+
+let bullets = [];
+function spawnBullet(x, y, vx, vy, color='#fff', size=6, damage=3) {
+  bullets.push({ x, y, vx, vy, color, size, damage });
+}
+
+const BOX = { left: W/2 - 100, right: W/2 + 100, top: H/2 + 30, bottom: H/2 + 150 };
+BOX.width = BOX.right - BOX.left;
+BOX.height = BOX.bottom - BOX.top;
+BOX.centerX = (BOX.left + BOX.right) / 2;
+BOX.centerY = (BOX.top + BOX.bottom) / 2;
+
+function spawnBulletsDown() {
+  for (let i = 0; i < 4; i++) {
+    const x = BOX.left + 10 + Math.random() * (BOX.width - 20);
+    spawnBullet(x, BOX.top - 10, 0, 2 + Math.random() * 2, '#fff', 6, 2);
+  }
+}
+function spawnSpades() {
+  for (let i = 0; i < 3; i++) {
+    const fromLeft = Math.random() < 0.5;
+    const x = fromLeft ? BOX.left - 20 : BOX.right + 20;
+    const vx = fromLeft ? 3 : -3;
+    const y = BOX.top + 10 + Math.random() * (BOX.height - 20);
+    spawnBullet(x, y, vx, 0, '#3399ff', 8, 3);
+  }
+}
+function spawnAxes() {
+  for (let i = 0; i < 5; i++) {
+    spawnBullet(BOX.left + i * 40, BOX.top - 10, 0, 3, '#ff9600', 10, 4);
+  }
+}
+function spawnRandom() {
+  for (let i = 0; i < 6; i++) {
+    const x = BOX.left + Math.random() * BOX.width;
+    const y = BOX.top + Math.random() * BOX.height;
+    spawnBullet(x, y, (Math.random()-0.5)*6, (Math.random()-0.5)*6, '#c800c8', 7, 3);
+  }
+}
+const ATTACKS = { bulletsDown: spawnBulletsDown, spades: spawnSpades, axes: spawnAxes, random: spawnRandom };
+
+let state = 'menu';
+let stateTimer = 0;
+let dialogText = '';
+let attackBarX = BOX.left;
+let attackDir = 1;
+const menuOptions = ['FIGHT','ACT','ITEM','SPARE'];
+
+function takeDamage(dmg) {
+  if (player.invuln > 0) return;
+  player.hp -= dmg;
+  player.kr += Math.min(dmg, 3);
+  player.invuln = 30;
+}
+function updateKR() {
+  if (player.kr > 0 && player.invuln <= 0) { player.kr--; player.hp--; }
+}
+
+function startPlayerTurn() {
+  state = 'menu'; stateTimer = 0;
+  player.menuIndex = 0; player.subIndex = 0;
+  bullets = []; player.kr = 0;
+}
+function startEnemyTurn() {
+  state = 'bullet'; stateTimer = 180; bullets = [];
+  const atk = currentEnemy.attacks[Math.floor(Math.random()*currentEnemy.attacks.length)];
+  ATTACKS[atk]();
+}
+function doAttack() {
+  state = 'attack';
+  attackBarX = BOX.left; attackDir = 1;
+}
+function resolveAttack() {
+  const center = BOX.centerX;
+  const dist = Math.abs(attackBarX - center);
+  const maxDist = BOX.width / 2;
+  const accuracy = Math.max(0, 1 - dist / maxDist);
+  const damage = Math.floor(player.attack * (0.5 + accuracy));
+  currentEnemy.hp -= damage;
+  dialogText = `Вы нанесли ${damage} урона!`;
+  state = 'dialog'; stateTimer = 0;
+}
+function doAct() {
+  currentEnemy.mercy++;
+  const t = currentEnemy.dialogue[Math.floor(Math.random()*currentEnemy.dialogue.length)];
+  dialogText = t + `  (Mercy: ${currentEnemy.mercy}/${currentEnemy.spareCondition})`;
+  state = 'dialog'; stateTimer = 0;
+}
+function doItem() {
+  player.hp = Math.min(player.maxHp, player.hp + 10);
+  dialogText = 'Вы использовали Пирог. +10 HP';
+  state = 'dialog'; stateTimer = 0;
+}
+function doSpare() {
+  if (isSparable()) {
+    currentEnemy.hp = 0;
+    dialogText = `${currentEnemy.name} пощажен! Победа!`;
+  } else {
+    dialogText = `${currentEnemy.name} не готов к пощаде.`;
+  }
+  state = 'dialog'; stateTimer = 0;
+}
+function nextEnemyOrWin() {
+  const idx = enemies.indexOf(currentEnemy);
+  if (idx + 1 < enemies.length) { currentEnemy = enemies[idx+1]; startPlayerTurn(); }
+  else state = 'win';
+}
+function resetGame() {
+  player.hp = player.maxHp; player.kr = 0; player.tp = 0;
+  player.soulX = BOX.centerX; player.soulY = BOX.centerY;
+  bullets = []; currentEnemy = enemies[0];
+  enemies.forEach(e => { e.hp = e.maxHp; e.mercy = 0; });
+  startPlayerTurn();
+}
+
+function update() {
+  if (player.invuln > 0) player.invuln--;
+  updateKR();
+  if (player.hp <= 0) { state = 'gameover'; return; }
+
+  if (state === 'bullet') {
+    let dx = 0, dy = 0;
+    if (keys.left) dx -= player.soulSpeed;
+    if (keys.right) dx += player.soulSpeed;
+    if (keys.up) dy -= player.soulSpeed;
+    if (keys.down) dy += player.soulSpeed;
+    player.soulX = Math.max(BOX.left + 8, Math.min(BOX.right - 8, player.soulX + dx));
+    player.soulY = Math.max(BOX.top + 8, Math.min(BOX.bottom - 8, player.soulY + dy));
+
+    bullets = bullets.filter(b => {
+      b.x += b.vx; b.y += b.vy;
+      if (b.x < BOX.left - 30 || b.x > BOX.right + 30 ||
+          b.y < BOX.top - 30 || b.y > BOX.bottom + 30) return false;
+      const dxc = b.x - player.soulX, dyc = b.y - player.soulY;
+      if (Math.hypot(dxc, dyc) < b.size + 5) { takeDamage(b.damage); return false; }
+      return true;
+    });
+
+    stateTimer--;
+    if (stateTimer > 0 && stateTimer % 60 === 0) {
+      const atk = currentEnemy.attacks[Math.floor(Math.random()*currentEnemy.attacks.length)];
+      ATTACKS[atk]();
+    }
+    if (stateTimer <= 0) { bullets = []; startPlayerTurn(); }
+
+  } else if (state === 'attack') {
+    attackBarX += 6 * attackDir;
+    if (attackBarX >= BOX.right - 6) { attackBarX = BOX.right - 6; attackDir = -1; }
+    if (attackBarX <= BOX.left) { attackBarX = BOX.left; attackDir = 1; }
+
+  } else if (state === 'dialog') {
+    stateTimer++;
+    if (stateTimer > 20 && keys.z) {
+      keys.z = false;
+      if (currentEnemy.hp <= 0) nextEnemyOrWin();
+      else startEnemyTurn();
+    }
+  }
+}
+
+function drawText(text, x, y, color='#fff', size=16, center=false) {
+  ctx.fillStyle = color;
+  ctx.font = `bold ${size}px monospace`;
+  ctx.textAlign = center ? 'center' : 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, x, y);
+}
+function drawHpBar(x, y, hp, maxHp, w=100) {
+  ctx.fillStyle = '#282828'; ctx.fillRect(x, y, w, 16);
+  ctx.strokeStyle = '#ff0000'; ctx.lineWidth = 2; ctx.strokeRect(x, y, w, 16);
+  if (hp > 0) {
+    ctx.fillStyle = '#ffff00';
+    ctx.fillRect(x+2, y+2, (w-4) * hp / maxHp, 12);
+  }
+}
+
+function draw() {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+
+  ctx.fillStyle = '#282828'; ctx.fillRect(0, 0, W, 220);
+  ctx.beginPath();
+  ctx.arc(currentEnemy.x, currentEnemy.y, 50, 0, Math.PI*2);
+  ctx.fillStyle = currentEnemy.color; ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(currentEnemy.x-15, currentEnemy.y-10, 8, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(currentEnemy.x+15, currentEnemy.y-10, 8, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.arc(currentEnemy.x-15, currentEnemy.y-10, 4, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(currentEnemy.x+15, currentEnemy.y-10, 4, 0, Math.PI*2); ctx.fill();
+
+  drawText(currentEnemy.name, W/2, 30, '#fff', 32, true);
+  drawHpBar(W/2 - 50, 60, currentEnemy.hp, currentEnemy.maxHp, 100);
+  drawText(`Mercy: ${currentEnemy.mercy}/${currentEnemy.spareCondition}`, W - 20, 60, '#00ff00', 14);
+  ctx.textAlign = 'left';
+
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 3;
+  ctx.strokeRect(BOX.left, BOX.top, BOX.width, BOX.height);
+
+  if (state === 'bullet') {
+    bullets.forEach(b => {
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.size, 0, Math.PI*2);
+      ctx.fillStyle = b.color; ctx.fill();
+    });
+  }
+
+  if (state === 'bullet' || state === 'menu' || state === 'attack') {
+    let sx = state === 'bullet' ? player.soulX : BOX.centerX;
+    let sy = state === 'bullet' ? player.soulY : BOX.centerY;
+    ctx.beginPath(); ctx.arc(sx, sy, 8, 0, Math.PI*2);
+    ctx.fillStyle = '#ff0000'; ctx.fill();
+    ctx.beginPath(); ctx.arc(sx-3, sy-3, 3, 0, Math.PI*2);
+    ctx.fillStyle = '#ff9999'; ctx.fill();
+  }
+
+  if (state === 'attack') {
+    ctx.fillStyle = '#646464'; ctx.fillRect(BOX.left, BOX.centerY + 20, BOX.width, 20);
+    ctx.fillStyle = '#ffff00'; ctx.fillRect(attackBarX - 4, BOX.centerY + 15, 8, 30);
+    drawText('Нажми Z в нужный момент!', W/2, BOX.top - 20, '#fff', 14, true);
+  }
+
+  if (state === 'menu') {
+    const btnW = BOX.width / 4;
+    menuOptions.forEach((opt, i) => {
+      const x = BOX.left + i * btnW + btnW/2;
+      drawText(opt, x, BOX.centerY, i === player.menuIndex ? '#ffff00' : '#ff9600', 14, true);
+    });
+  }
+
+  if (state === 'act') {
+    drawText('Действия:', BOX.left + 5, BOX.top + 15, '#fff', 14);
+    currentEnemy.dialogue.forEach((d, i) => {
+      drawText(d, BOX.left + 5, BOX.top + 35 + i * 18,
+        i === player.subIndex ? '#ffff00' : '#808080', 12);
+    });
+    drawText('Z - выбрать, X - назад', BOX.centerX, BOX.bottom - 15, '#fff', 12, true);
+  }
+
+  if (state === 'item') {
+    drawText('Пирог  x1', BOX.left + 5, BOX.top + 15, '#ffff00', 14);
+    drawText('Z - использовать, X - назад', BOX.centerX, BOX.bottom - 15, '#fff', 12, true);
+  }
+
+  if (state === 'dialog') {
+    drawText(dialogText, BOX.centerX, BOX.centerY, '#fff', 13, true);
+    drawText('[Z] Продолжить', BOX.centerX, BOX.bottom - 15, '#808080', 12, true);
+  }
+
+  drawText('HP', 20, H - 50, '#fff', 14);
+  drawHpBar(50, H - 58, player.hp, player.maxHp, 100);
+  drawText(`${player.hp}/${player.maxHp}`, 160, H - 50, '#fff', 14);
+  if (player.kr > 0) drawText(`KR: ${player.kr}`, 160, H - 30, '#c800c8', 14);
+
+  drawText('TP', W - 150, H - 50, '#fff', 14);
+  ctx.fillStyle = '#282828'; ctx.fillRect(W - 120, H - 58, 100, 16);
+  ctx.fillStyle = '#3399ff'; ctx.fillRect(W - 120, H - 58, player.tp, 16);
+  drawText(`${Math.floor(player.tp)}%`, W - 120, H - 30, '#3399ff', 14);
+
+  if (state === 'gameover') {
+    ctx.fillStyle = 'rgba(0,0,0,0.8)'; ctx.fillRect(0,0,W,H);
+    drawText('GAME OVER', W/2, H/2 - 20, '#ff0000', 36, true);
+    drawText('Нажми R для рестарта', W/2, H/2 + 30, '#fff', 16, true);
+  }
+  if (state === 'win') {
+    ctx.fillStyle = 'rgba(0,0,0,0.8)'; ctx.fillRect(0,0,W,H);
+    drawText('VICTORY!', W/2, H/2 - 20, '#ffff00', 36, true);
+    drawText('Ты победил всех врагов!', W/2, H/2 + 20, '#fff', 16, true);
+    drawText('Нажми R для рестарта', W/2, H/2 + 60, '#fff', 14, true);
+  }
+}
+
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+  </html>
